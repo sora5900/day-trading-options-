@@ -224,9 +224,10 @@ class PolygonSource(QuoteSource):
         if chain:
             results.extend(self._field_population_checks(chain))
             results.extend(self._zero_dte_check(chain))
+            results.append(self._atm_straddle_check(chain, spot))
         else:
             for r in ("chain_bid_ask", "chain_greeks", "chain_iv",
-                      "chain_open_interest", "chain_volume",
+                      "chain_open_interest", "chain_volume", "atm_straddle",
                       "exchange_timestamp", "delay_class", "zero_dte"):
                 add(CheckResult(r, Status.SKIP, "no chain returned"))
 
@@ -326,6 +327,35 @@ class PolygonSource(QuoteSource):
             f"no 0DTE contracts right now (today={today}). Expiries seen: "
             f"{expiries[:4]}. Expected on a trading day; benign on a "
             "weekend/holiday — re-run during market hours to confirm")]
+
+    def _atm_straddle_check(self, chain: list, spot: float) -> CheckResult:
+        """Phase 1's entire signal rests on the ATM straddle mid, so verify
+        the nearest expiry actually has two-sided quotes on BOTH legs."""
+        expiries = sorted({c["expiry"] for c in chain if c.get("expiry")})
+        if not expiries:
+            return CheckResult("atm_straddle", Status.FAIL, "no expiries")
+        exp = expiries[0]
+        legs = {}
+        for right in ("C", "P"):
+            cands = [c for c in chain
+                     if c["expiry"] == exp and c["right"] == right
+                     and c.get("bid") and c.get("ask")]
+            if cands:
+                legs[right] = min(cands, key=lambda c: abs(c["strike"] - spot))
+        if len(legs) < 2:
+            return CheckResult(
+                "atm_straddle", Status.FAIL,
+                f"expiry {exp}: two-sided ATM quotes missing for "
+                f"{sorted({'C', 'P'} - set(legs))}")
+        straddle = sum((legs[r]["bid"] + legs[r]["ask"]) / 2 for r in ("C", "P"))
+        return CheckResult(
+            "atm_straddle", Status.PASS,
+            f"expiry {exp}: ATM straddle mid = {straddle:.2f} "
+            f"({straddle / spot * 100:.2f}% of spot = priced move)",
+            evidence={"expiry": exp, "straddle_mid": round(straddle, 4),
+                      "priced_move_pct": round(straddle / spot, 6),
+                      "call_strike": legs["C"]["strike"],
+                      "put_strike": legs["P"]["strike"]})
 
     def _xsp_checks(self) -> list:
         """XSP ticker conventions differ for index options; try candidates."""

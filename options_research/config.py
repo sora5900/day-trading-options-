@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Config:
+    # Requirement profile: 'phase1' runs on the cheapest delayed plan and
+    # needs prices only; 'full' additionally requires vendor Greeks and IV.
+    profile: str = "phase1"
+
     # Universe. XSP (H1 arm B) is enabled only if the capability probe
     # confirms both the option chain and the underlying index value — it is
     # never assumed available.

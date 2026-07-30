@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 
 from . import db, market_calendar as cal
-from .capabilities import ProbeReport, Status
+from .capabilities import PHASE1, ProbeReport, Status
 from .config import Config
 
 log = logging.getLogger("collector")
@@ -37,17 +37,19 @@ class Collector:
 
     # ── capability gate ─────────────────────────────────────────────────────
 
-    def probe(self, record: bool = True) -> ProbeReport:
+    def probe(self, record: bool = True,
+              profile: str | None = None) -> ProbeReport:
         results = self.source.probe()
-        report = ProbeReport(provider=self.source.name, results=results)
+        report = ProbeReport(provider=self.source.name, results=results,
+                             profile=profile or self.cfg.profile)
         if record:
             db.record_probe(self.conn, self.source.name, cal.utcnow_iso(),
                             results)
         self._probe_passed = report.can_collect
         return report
 
-    def require_capability(self) -> ProbeReport:
-        report = self.probe()
+    def require_capability(self, profile: str | None = None) -> ProbeReport:
+        report = self.probe(profile=profile)
         if not report.can_collect:
             raise CapabilityError(
                 "collection refused — unmet blocking requirements: "
