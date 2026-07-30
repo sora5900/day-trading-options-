@@ -1,23 +1,23 @@
 """Feature engine: derived per snapshot, recomputable, no look-ahead.
 
-Every input read goes through the db.*_at helpers, which are bounded by the
-decision timestamp. iv30 here is a PROXY: the vega-weighted ATM IV of the
-nearest collected expiries (we collect 0-7 DTE). It is consistent over time,
-which is what ranking and VRP need — but it is not a true 30-day IV. Noted in
-the schema docs and in the reporter.
+Phase 1 features are PRICE-SPACE (see signals.py) and require no vendor IV or
+Greeks. Vendor-derived fields are still computed and stored when the plan
+populates them, so a later profile upgrade has history to work with — but
+nothing in Phase 1 depends on them.
+
+Every input read is bounded by the decision timestamp on the exchange clock.
 """
 
 import math
 import statistics
 from datetime import timedelta
 
-from . import db, market_calendar as cal
+from . import db, market_calendar as cal, signals
 
-ANNUALIZE_MIN = math.sqrt(252 * 390)   # per-minute log-returns → annual vol
+ANNUALIZE_MIN = math.sqrt(252 * 390)
 
 
 def _realized_vol(rows, window_min: float, as_of: str) -> float | None:
-    """Annualized realized vol from underlying `last` over trailing window."""
     cutoff = cal.parse_ts(as_of) - timedelta(minutes=window_min)
     pts = [(cal.parse_ts(r["event_ts"]), r["last"]) for r in rows
            if r["last"] and cal.parse_ts(r["event_ts"]) >= cutoff]
@@ -28,7 +28,6 @@ def _realized_vol(rows, window_min: float, as_of: str) -> float | None:
         if prev_p and prev_p > 0 and p > 0:
             dt_min = (t - prev_t).total_seconds() / 60.0
             if dt_min > 0:
-                # per-minute-normalized log return
                 rets.append(math.log(p / prev_p) / math.sqrt(dt_min))
         prev_t, prev_p = t, p
     if len(rets) < 4:
@@ -37,12 +36,11 @@ def _realized_vol(rows, window_min: float, as_of: str) -> float | None:
 
 
 def _atm_iv(chain, spot: float, expiry: str) -> float | None:
-    """Vega-weighted IV of contracts within 1% of spot for one expiry."""
     num = den = 0.0
     for c in chain:
         if c["expiry"] != expiry or not c["iv"] or c["iv"] <= 0:
             continue
-        if abs(c["strike"] - spot) / spot > 0.01:
+        if not spot or abs(c["strike"] - spot) / spot > 0.01:
             continue
         w = c["vega"] if c["vega"] and c["vega"] > 0 else 1.0
         num += c["iv"] * w
@@ -51,7 +49,6 @@ def _atm_iv(chain, spot: float, expiry: str) -> float | None:
 
 
 def _skew_25d(chain, expiry: str) -> float | None:
-    """IV(25-delta put) - IV(25-delta call), nearest expiry."""
     best_p = best_c = None
     for c in chain:
         if c["expiry"] != expiry or not c["iv"] or c["delta"] is None:
@@ -69,21 +66,7 @@ def _skew_25d(chain, expiry: str) -> float | None:
     return None
 
 
-def _liquidity_score(chain, spot: float) -> float | None:
-    """Median spread% across near-ATM contracts (within 1% of spot).
-    Lower is better; this is the number a strategy's edge must beat."""
-    spreads = []
-    for c in chain:
-        if abs(c["strike"] - spot) / spot > 0.01:
-            continue
-        b, a = c["bid"], c["ask"]
-        if b and a and a >= b and (a + b) > 0:
-            spreads.append((a - b) / ((a + b) / 2))
-    return statistics.median(spreads) if spreads else None
-
-
 def _atr_pct(conn, symbol: str, as_of: str, n_days: int = 14) -> float | None:
-    """ATR% from prior days' EOD-ish snapshot rows (true range vs prev close)."""
     day = cal.trading_day_of(as_of)
     rows = conn.execute(
         "SELECT substr(event_ts,1,10) AS d, MAX(day_high) AS h, "
@@ -97,24 +80,39 @@ def _atr_pct(conn, symbol: str, as_of: str, n_days: int = 14) -> float | None:
         if not (r["h"] and r["l"] and r["c"]):
             continue
         pc = r["pc"] or r["c"]
-        tr = max(r["h"] - r["l"], abs(r["h"] - pc), abs(r["l"] - pc))
-        trs.append(tr / r["c"])
+        trs.append(max(r["h"] - r["l"], abs(r["h"] - pc), abs(r["l"] - pc))
+                   / r["c"])
     return statistics.mean(trs) if trs else None
 
 
-def _regime(vwap_dev, rv30, rv_hist) -> str:
-    """Coarse classifier: trend / chop / high-vol. Deliberately dumb in v1."""
-    if rv30 and rv_hist and len(rv_hist) >= 20:
-        srt = sorted(rv_hist)
-        if rv30 > srt[int(len(srt) * 0.8)]:
+def _regime(vwap_dev, priced_move, pm_hist) -> str:
+    """Coarse classifier. Deliberately simple; slices are train-only anyway."""
+    if priced_move and pm_hist and len(pm_hist) >= 20:
+        srt = sorted(pm_hist)
+        if priced_move > srt[int(len(srt) * 0.8)]:
             return "high-vol"
     if vwap_dev is not None and abs(vwap_dev) > 0.004:
         return "trend"
     return "chop"
 
 
+def nearest_expiry(chain, today: str, dte_max: int = 2) -> str | None:
+    from datetime import date
+    try:
+        t = date.fromisoformat(today)
+    except ValueError:
+        return None
+    for e in sorted({c["expiry"] for c in chain if c["expiry"]}):
+        try:
+            dte = (date.fromisoformat(e) - t).days
+        except ValueError:
+            continue
+        if 0 <= dte <= dte_max:
+            return e
+    return None
+
+
 def compute_features(conn, symbol: str, ts: str) -> dict | None:
-    """Compute and persist the feature row for (symbol, ts)."""
     u = db.underlying_at(conn, symbol, ts)
     chain = db.chain_at(conn, symbol, ts)
     if not u or not u["last"]:
@@ -122,31 +120,34 @@ def compute_features(conn, symbol: str, ts: str) -> dict | None:
     spot = u["last"]
     day = cal.trading_day_of(ts)
     day_rows = db.underlying_between(conn, symbol, f"{day}T00:00:00Z", ts)
+    expiry = nearest_expiry(chain, day)
 
+    # ── price-space (Phase 1) ───────────────────────────────────────────
+    straddle = signals.straddle_mid(chain, spot, expiry) if expiry else None
+    pm = (straddle / spot) if (straddle and spot) else None
+    rm30 = signals.realized_move(conn, symbol, ts, 30)
+    vrp_price = (pm - rm30) if (pm is not None and rm30 is not None) else None
+    skew_price = signals.skew_px(chain, spot, expiry) if expiry else None
+
+    # ── vendor-derived (stored if available, never required) ────────────
+    iv_near = _atm_iv(chain, spot, expiry) if expiry else None
+    expiries = sorted({c["expiry"] for c in chain if c["expiry"]})
+    iv_next = (_atm_iv(chain, spot, expiries[1])
+               if len(expiries) > 1 else None)
     rv5 = _realized_vol(day_rows, 5, ts)
     rv30 = _realized_vol(day_rows, 30, ts)
 
-    expiries = sorted({c["expiry"] for c in chain})
-    iv_near = _atm_iv(chain, spot, expiries[0]) if expiries else None
-    iv_next = _atm_iv(chain, spot, expiries[1]) if len(expiries) > 1 else None
-    iv30 = iv_near  # proxy — see module docstring
-    term_slope = (iv_next - iv_near) if (iv_near and iv_next) else None
-
-    # IV rank/percentile vs own trailing history (prior feature rows)
-    hist = db.features_history(conn, symbol, ts, limit=20 * 80)
+    hist = db.features_history(conn, symbol, ts, limit=20000)
     iv_hist = [r["iv30"] for r in hist if r["iv30"]]
-    rv_hist = [r["realized_vol_30m"] for r in hist if r["realized_vol_30m"]]
+    pm_hist = [r["priced_move"] for r in hist if r["priced_move"]]
     iv_rank = iv_pctile = None
-    if iv30 and len(iv_hist) >= 20:
+    if iv_near and len(iv_hist) >= 20:
         lo, hi = min(iv_hist), max(iv_hist)
-        iv_rank = (iv30 - lo) / (hi - lo) if hi > lo else 0.5
-        iv_pctile = sum(1 for x in iv_hist if x < iv30) / len(iv_hist)
+        iv_rank = (iv_near - lo) / (hi - lo) if hi > lo else 0.5
+        iv_pctile = sum(1 for x in iv_hist if x < iv_near) / len(iv_hist)
 
-    vrp = (iv30 - rv30) if (iv30 and rv30) else None
-
-    # Opening range: first 15 minutes of the session
-    orb_high = orb_low = None
-    orb_broken = None
+    # ── opening range ───────────────────────────────────────────────────
+    orb_high = orb_low = orb_broken = None
     mins = cal.minutes_since_open(ts)
     if mins is not None and mins >= 0:
         orb_rows = [r for r in day_rows
@@ -156,34 +157,32 @@ def compute_features(conn, symbol: str, ts: str) -> dict | None:
             orb_high = max(r["last"] for r in orb_rows)
             orb_low = min(r["last"] for r in orb_rows)
             if mins > 15:
-                if spot > orb_high:
-                    orb_broken = "UP"
-                elif spot < orb_low:
-                    orb_broken = "DOWN"
+                orb_broken = ("UP" if spot > orb_high
+                              else "DOWN" if spot < orb_low else None)
 
     vwap_dev = ((spot - u["vwap"]) / u["vwap"]) if u["vwap"] else None
-    atr_pct = _atr_pct(conn, symbol, ts)
+    gate = signals.gate_mode(chain)
 
     row = {
         "ts": ts, "symbol": symbol,
-        "iv30": iv30, "iv_rank": iv_rank, "iv_percentile": iv_pctile,
-        "realized_vol_5m": rv5, "realized_vol_30m": rv30, "vrp": vrp,
+        "straddle_mid": straddle, "priced_move": pm,
+        "realized_move_30m": rm30, "vrp_px": vrp_price, "skew_px": skew_price,
+        "iv30": iv_near, "iv_rank": iv_rank, "iv_percentile": iv_pctile,
+        "realized_vol_5m": rv5, "realized_vol_30m": rv30,
+        "vrp": ((iv_near - rv30) if (iv_near and rv30) else None),
+        "skew_25d": _skew_25d(chain, expiry) if expiry else None,
+        "term_slope": ((iv_next - iv_near) if (iv_near and iv_next) else None),
         "orb_high": orb_high, "orb_low": orb_low, "orb_broken": orb_broken,
-        "vwap_dev": vwap_dev, "atr_pct": atr_pct,
-        "skew_25d": _skew_25d(chain, expiries[0]) if expiries else None,
-        "term_slope": term_slope,
-        "liquidity_score": _liquidity_score(chain, spot),
-        "regime": _regime(vwap_dev, rv30, rv_hist),
-        # carried through so the validator can refuse to pool data eras
+        "vwap_dev": vwap_dev, "atr_pct": _atr_pct(conn, symbol, ts),
+        "liquidity_score": signals.liquidity_score(chain, spot),
+        "gate_mode": gate,
+        "regime": _regime(vwap_dev, pm, pm_hist),
         "delay_class": u["delay_class"],
     }
+    cols = list(row.keys())
     conn.execute(
-        "INSERT OR REPLACE INTO features VALUES "
-        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (row["ts"], row["symbol"], row["iv30"], row["iv_rank"],
-         row["iv_percentile"], row["realized_vol_5m"], row["realized_vol_30m"],
-         row["vrp"], row["orb_high"], row["orb_low"], row["orb_broken"],
-         row["vwap_dev"], row["atr_pct"], row["skew_25d"], row["term_slope"],
-         row["liquidity_score"], row["regime"], row["delay_class"]))
+        f"INSERT OR REPLACE INTO features ({','.join(cols)}) "
+        f"VALUES ({','.join('?' * len(cols))})",
+        [row[c] for c in cols])
     conn.commit()
     return row

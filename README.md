@@ -1,89 +1,122 @@
-# Options Day-Trading Research System
+# Options Research Platform
 
-**This is not a trading bot.** It is a research system whose product is a
-verdict: *"does this setup have an edge on days the model has never seen —
+**Not a trading bot.** An evidence-gathering platform whose product is a
+verdict: *"does this hypothesis have an edge on days it has never seen —
 after real costs?"*
 
-Full design rationale and the lessons it encodes are in
-[`OPTIONS_RESEARCH_SPEC.md`](OPTIONS_RESEARCH_SPEC.md). The short version,
-learned expensively on a prior betting-research project:
+Design documents, in reading order:
 
-- Mining finds fake edges — every pattern shipped without a train/test split
-  failed forward.
-- Structure replicates; narratives don't.
-- Win rate is vanity; **edge vs the price, net of friction, is the only number
-  that matters** — and options friction is 10–20% round trip.
-- The default verdict is DISCARD. A strategy earns continuation.
+| Doc | What it fixes |
+|---|---|
+| [`OPTIONS_RESEARCH_SPEC.md`](OPTIONS_RESEARCH_SPEC.md) | Original architecture and the lessons behind it |
+| [`HYPOTHESES.md`](HYPOTHESES.md) | Formal pre-registration; settlement mechanics; promotion criteria |
+| [`PHASE1.md`](PHASE1.md) | **Start here.** Delayed-plan redesign, price-space signals, and the power analysis that governs what Phase 1 can claim |
 
 **Hard rule: there is no broker execution path in this codebase**, and none may
-be added until a strategy passes the §7 validation protocol.
+be added until a hypothesis passes the full promotion bar (`HYPOTHESES.md` §6).
 
-## Architecture
+## The number that governs everything
 
+A $2-wide 0DTE credit spread has a **per-trade standard deviation of ~$46**
+against an EV measured in single dollars. So:
+
+| Test sample | Minimum detectable edge |
+|---|---|
+| n = 100 | **$12.80/trade — 6.4% of capital at risk** |
+| n = 200 | $9.05/trade — 4.5% |
+
+A real $3–5/trade edge needs **16–62 months** of collection. Phase 1 therefore
+does *not* claim to find edges. It measures friction fast, runs the
+underlying-only momentum test that *can* reach significance quickly, screens
+for implausibly large effects, and validates the machinery. Every report
+prints the minimum detectable edge beside each interval, and any interval
+containing zero is annotated: **a null is not evidence of no edge.**
+
+## Adding a hypothesis
+
+The platform is registry-driven. A new family is one file:
+
+```python
+@register
+class MyThing(Hypothesis):
+    """Why this should work, mechanically."""
+    id, version, family = "my_thing", "v1", "mean_reversion"
+    params = MyParams()                    # frozen dataclass
+
+    def detect(self, ctx: DecisionContext) -> Candidate | None:
+        ...
 ```
-COLLECTOR → FEATURES → SETUP DETECTOR → PAPER FILL ENGINE → GRADER → VALIDATOR → REPORTER
-raw truth    derived     hypotheses       pays the spread     net P&L   unseen days   honest verdicts
-```
 
-- **Collector** (`collector.py`) — SPY/QQQ snapshots, strikes ±7% of spot,
-  0–7 DTE, 5-min chain cadence, NYSE-calendar gated, data-quality checks on
-  every snapshot, two-source cross-check.
-- **Features** (`features.py`) — IV rank, VRP, opening range, VWAP deviation,
-  realized vol, skew, term slope, liquidity score, regime. Recomputable;
-  raw tables are never edited.
-- **Strategies** (`strategies/`) — versioned hypotheses with mechanical
-  rationales: ORB debit vertical, VRP-fade credit spread, gap fade (plus its
-  naive baseline, which the conditioned version must beat).
-- **Paper fill engine** (`fill_engine.py`) — the component that decides whether
-  this is real. Buys pay the ask, sells receive the bid, plus slippage and
-  commissions; wide/illiquid contracts are rejected as UNFILLABLE. Never fills
-  at mid.
-- **Grader** (`grader.py`) — exit rules (target/stop/time), MAE/MFE, P&L net
-  of all costs.
-- **Validator** (`validator.py`) — train/test split **by day**, frozen on first
-  use; verdicts only from unseen days; minimum 100 test trades over 30 days
-  before any verdict other than UNPROVEN.
-- **Reporter** (`reporter.py`) — the shadow ledger and per-strategy verdicts.
+Everything else is inherited: pre-registration hashing, split assignment,
+journaling, deterministic replay, day-bootstrapped intervals, control
+comparison, and independent per-hypothesis verdicts.
 
-## Setup
+**Pre-registration is enforced, not trusted.** Each hypothesis hashes its
+frozen parameters, and the hash is stored on every trade. Edit a threshold
+without bumping `version` and the platform *refuses to run* rather than
+pooling two rule sets into one sample.
+
+## Registered hypotheses (Phase 1)
+
+| ID | Family | Signal |
+|---|---|---|
+| `h1_p1_vrp` | variance_risk_premium | Priced move (ATM straddle) vs realized move, midday |
+| `h2_p1_skew` | variance_risk_premium | Risk-reversal price spike; must beat H1 on shared days |
+| `h3_p1_momentum` | intraday_momentum | Gated behind an underlying-only reproduction + friction hurdle |
+| `c1_orb_control` | control | **Leakage detector.** Positive unseen result halts the pipeline |
+| `c2_random_cost` | control | **Cost meter.** Untriggered entries; EV ≈ −friction or all verdicts are void |
+
+Phase 1 needs **prices and an exchange clock only** — no vendor Greeks, no
+vendor IV. Delta selection is replaced by `spot − 1.25 × straddle_mid`
+(≈1 SD ≈ 15–16 delta equivalent), and IV-space signals by their price-space
+equivalents.
+
+## Usage
 
 ```bash
 pip install -r requirements.txt
-export POLYGON_API_KEY=...     # primary (Starter tier is fine — delayed is fine)
-export TRADIER_TOKEN=...       # optional but recommended cross-check (sandbox is free)
+export POLYGON_API_KEY=...
 
+python -m options_research probe        # capability gate; exit 2 = refused
 python -m options_research init
-python -m options_research run          # market-hours research loop (paper only)
+python -m options_research run          # market-hours shadow loop, paper only
 ```
-
-Other commands:
 
 ```bash
-python -m options_research collect --once     # single snapshot cycle
-python -m options_research crosscheck         # source-divergence check
-python -m options_research freeze-split 2026-09-15   # first TEST day — frozen forever
-python -m options_research validate           # assign splits + write verdicts
-python -m options_research report --trades    # shadow ledger
+python -m options_research manifest             # pre-registration record
+python -m options_research controls             # control health + friction
+python -m options_research freeze-split 2026-09-15
+python -m options_research validate             # halts if controls are sick
+python -m options_research report --trades
+python -m options_research replay 42            # why trade 42 did what it did
 ```
 
-## Discipline (non-negotiable)
+## Invariants (enforced by tests)
 
-1. **No look-ahead.** Decisions at time T read only data ≤ T, enforced by the
-   query layer and asserted in `tests/test_no_lookahead.py`.
-2. **The split is frozen.** Changing the cutoff after the fact raises an error.
-   Tuning after peeking at test burns that test set: bump the strategy
-   `version` and treat the old test days as train.
-3. **Fills are pessimistic.** If a strategy's edge is smaller than its spread
-   cost, the report shows it immediately (`avg_spread_paid_pct`).
-4. **Expect "no edge".** That is a successful outcome for a research system;
-   a system that always finds something is broken.
+1. **No look-ahead.** Reads are bounded by `event_ts` (the exchange clock),
+   never `fetch_ts`. A quote that *happened* at 14:00 but *arrived* at 14:20
+   is visible to a 14:05 decision.
+2. **Frozen split.** Changing the cutoff after the fact raises.
+3. **Never pool** delayed-era with realtime-era trades, or trades with
+   different parameter hashes.
+4. **Bootstrap by day, never by trade.** Intraday trades are correlated;
+   trade-level resampling manufactures precision.
+5. **Slices are train-only.** A strong slice becomes a new versioned
+   hypothesis with a fresh test set, never a verdict.
+6. **Pessimistic fills.** Buys pay the ask, sells receive the bid, plus
+   slippage and commissions. Never the mid.
+7. **No silent sample loss.** Trades stranded by collection gaps are swept and
+   marked `UNGRADED`, and the report states how many — an invisibly shrinking
+   sample is worse than a wrong number.
+8. **Controls gate verdicts.** `validate` refuses to issue any verdict if C1
+   or C2 reads anomalously.
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest tests/ -q      # 104 tests
 ```
 
-The fill engine is tested against hand-computed examples, including one that
-quantifies how much a mid-price backtest would lie (3× P&L overstatement on a
-realistic vertical round trip).
+Includes hand-computed fill examples, one of which quantifies how much a
+mid-price backtest would lie (**3× P&L overstatement** on a realistic vertical
+round trip).

@@ -51,15 +51,18 @@ CREATE INDEX IF NOT EXISTS idx_chain_leg
 -- ── DERIVED FEATURES (recomputable; safe to drop and rebuild) ────────────
 CREATE TABLE IF NOT EXISTS features (
   ts TEXT, symbol TEXT,              -- ts is a decision time on the event clock
+  -- price-space (Phase 1: no vendor IV or Greeks required)
+  straddle_mid REAL, priced_move REAL,
+  realized_move_30m REAL, vrp_px REAL, skew_px REAL,
+  -- vendor-derived (recorded when the plan provides them; never required)
   iv30 REAL, iv_rank REAL, iv_percentile REAL,
-  realized_vol_5m REAL, realized_vol_30m REAL,
-  vrp REAL,
+  realized_vol_5m REAL, realized_vol_30m REAL, vrp REAL,
+  skew_25d REAL, term_slope REAL,
+  -- shared
   orb_high REAL, orb_low REAL, orb_broken TEXT,
   vwap_dev REAL, atr_pct REAL,
-  skew_25d REAL, term_slope REAL,
-  liquidity_score REAL,
-  regime TEXT,
-  delay_class TEXT,
+  liquidity_score REAL, gate_mode TEXT,
+  regime TEXT, delay_class TEXT,
   PRIMARY KEY (ts, symbol));
 
 -- ── SETUPS & PAPER TRADES ────────────────────────────────────────────────
@@ -72,6 +75,10 @@ CREATE TABLE IF NOT EXISTS setups (
 CREATE TABLE IF NOT EXISTS paper_trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT, setup_id INTEGER,
   strategy TEXT, version TEXT, symbol TEXT, structure TEXT,
+  params_hash TEXT,                  -- pre-registration fingerprint
+  gate_mode TEXT,                    -- 'oi_volume' | 'spread_only'
+  capital_at_risk REAL,
+  hypothesis_family TEXT,
   legs_json TEXT,
   entry_ts TEXT, entry_fill REAL, entry_mid REAL, entry_spread_pct REAL,
   exit_ts TEXT, exit_fill REAL, exit_mid REAL, exit_reason TEXT,
@@ -107,6 +114,21 @@ CREATE TABLE IF NOT EXISTS split_config (
 CREATE TABLE IF NOT EXISTS capability_probe (
   ts TEXT, provider TEXT, requirement_id TEXT, status TEXT,
   detail TEXT, raw_error TEXT, evidence_json TEXT);
+
+-- ── DECISION JOURNAL (upgrade #6) + PRE-REGISTRATION MANIFEST ───────────
+CREATE TABLE IF NOT EXISTS decision_journal (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT, hypothesis_id TEXT, version TEXT, params_hash TEXT,
+  symbol TEXT, decision TEXT,        -- FIRE | UNFILLABLE | NO_FIRE
+  payload_json TEXT,                 -- features, signals, quotes, fill, config
+  code_version TEXT, trade_id INTEGER);
+CREATE INDEX IF NOT EXISTS idx_journal_trade ON decision_journal(trade_id);
+
+CREATE TABLE IF NOT EXISTS hypothesis_manifest (
+  hypothesis_id TEXT, version TEXT, params_hash TEXT,
+  registered_at TEXT, family TEXT, profile TEXT, is_control INTEGER,
+  manifest_json TEXT,
+  PRIMARY KEY (hypothesis_id, version, params_hash));
 
 CREATE TABLE IF NOT EXISTS schema_meta (
   id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);

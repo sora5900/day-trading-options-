@@ -69,6 +69,10 @@ def main():
     sub.add_parser("validate")
     p = sub.add_parser("report")
     p.add_argument("--trades", action="store_true", help="recent trades table")
+    sub.add_parser("manifest")
+    sub.add_parser("controls")
+    p = sub.add_parser("replay")
+    p.add_argument("trade_id", type=int)
 
     args = ap.parse_args()
     cfg = Config()
@@ -141,16 +145,47 @@ def main():
         print(f"split frozen at {res['cutoff']}: "
               f"+{res['assigned_train']} train, +{res['assigned_test']} test rows")
 
+    elif args.cmd == "manifest":
+        from .reporter import manifest_report
+        print(manifest_report(conn))
+
+    elif args.cmd == "controls":
+        from .validator import check_controls, measured_friction, PipelineHalt
+        try:
+            rep = check_controls(conn)
+        except PipelineHalt as e:
+            print("PIPELINE HALT — controls read anomalously:")
+            print(f"  {e}")
+            sys.exit(3)
+        print(f"C1 leakage control: {rep['c1']}")
+        print(f"C2 cost control:    {rep['c2']}")
+        print(f"measured friction:  {measured_friction(conn)}")
+        print("controls healthy")
+
+    elif args.cmd == "replay":
+        from .journal import replay, render_replay
+        print(render_replay(replay(conn, args.trade_id)))
+
     elif args.cmd == "validate":
-        from .validator import assign_splits, evaluate_all, SplitFrozenError
+        from .validator import (assign_splits, evaluate_all, check_controls,
+                                SplitFrozenError, PipelineHalt)
         try:
             assign_splits(conn)
         except (ValueError, SplitFrozenError) as e:
             sys.exit(str(e))
+        # controls gate every verdict: if the instruments are broken, the
+        # measurements they produced are not trustworthy
+        try:
+            check_controls(conn)
+        except PipelineHalt as e:
+            print("PIPELINE HALT — no verdicts will be issued.")
+            sys.exit(f"  {e}")
         for r in evaluate_all(conn):
             t = r["test"]
-            print(f"{r['strategy']} {r['version']}: {r['verdict']} — "
-                  f"test n={t['n']}, net ${t['pnl']}; {r['notes']}")
+            print(f"{r['hypothesis']}@{r['version']} "
+                  f"[{r['params_hash']}/{r['data_era']}]: {r['verdict']} — "
+                  f"test n={t['n']}, EV/trade ${t['ev_per_trade']}, "
+                  f"CI [{t['ci_lo']}, {t['ci_hi']}]; {r['notes']}")
 
     elif args.cmd == "report":
         from .reporter import build_report, recent_trades
