@@ -54,6 +54,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init")
+    p = sub.add_parser("probe")
+    p.add_argument("--source", choices=("polygon", "tradier"),
+                   default="polygon")
     p = sub.add_parser("collect")
     p.add_argument("--once", action="store_true")
     sub.add_parser("run")
@@ -76,16 +79,37 @@ def main():
     if args.cmd == "init":
         print(f"database ready at {cfg.db_path}")
 
+    elif args.cmd == "probe":
+        from .collector import Collector
+        from .sources.polygon import PolygonSource
+        from .sources.tradier import TradierSource
+        if args.source == "polygon":
+            if not cfg.polygon_api_key:
+                sys.exit("POLYGON_API_KEY is not set")
+            src = PolygonSource(cfg.polygon_api_key)
+        else:
+            if not cfg.tradier_token:
+                sys.exit("TRADIER_TOKEN is not set")
+            src = TradierSource(cfg.tradier_token, cfg.tradier_base)
+        report = Collector(conn, src, cfg).probe()
+        print(report.render())
+        xsp_chain = report.by_id("xsp_options")
+        xsp_under = report.by_id("xsp_underlying")
+        arm_b = (xsp_chain and xsp_chain.status.value == "PASS"
+                 and xsp_under and xsp_under.status.value == "PASS")
+        print(f"\nH1 arm B (XSP cash-settled comparator): "
+              f"{'AVAILABLE' if arm_b else 'NOT AVAILABLE — H1 runs SPY-only'}")
+        sys.exit(0 if report.can_collect else 2)
+
     elif args.cmd == "collect":
         from .collector import Collector
         primary, cross = _sources(cfg)
         c = Collector(conn, primary, cfg, cross_source=cross)
+        c.require_capability()
         if args.once:
-            ts = cal.utcnow_iso()
             for sym in cfg.symbols:
-                c.snap_underlying(sym, ts)
-                n = c.snap_chain(sym, ts)
-                print(f"{sym}: {n} contracts @ {ts}")
+                c.snap_underlying(sym)
+                print(f"{sym}: {c.snap_chain(sym)} contracts")
         else:
             c.run_loop()
 
@@ -94,6 +118,7 @@ def main():
         from .shadow import run_cycle
         primary, cross = _sources(cfg)
         c = Collector(conn, primary, cfg, cross_source=cross)
+        c.require_capability()
         print("shadow research loop — paper trades only, no orders exist here")
         c.run_loop(on_cycle=lambda ts: run_cycle(conn, ts, cfg))
 

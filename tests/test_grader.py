@@ -6,6 +6,7 @@ import json
 import pytest
 
 from options_research.grader import update_open_trades
+from conftest import insert_chain
 
 
 LEGS = {"legs": [
@@ -29,11 +30,7 @@ def _open_trade(conn, entry_fill=1.12, commissions=1.30):
 def _quotes(conn, ts, long_bid, long_ask, short_bid, short_ask):
     for strike, bid, ask in [(630.0, long_bid, long_ask),
                              (632.0, short_bid, short_ask)]:
-        conn.execute(
-            "INSERT OR REPLACE INTO chain_snap VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, "SPY", "2026-07-31", strike, "C", bid, ask, (bid + ask) / 2,
-             500, 1000, 0.2, 0.5, 0.01, -0.05, 0.1, 630.0))
+        insert_chain(conn, ts, strike=strike, right="C", bid=bid, ask=ask)
 
 
 def test_target_exit_hand_computed(conn):

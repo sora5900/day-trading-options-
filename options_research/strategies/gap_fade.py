@@ -86,9 +86,10 @@ class GapFadeConditioned(GapFadeAll):
         day = cal.trading_day_of(ts)
         prior = conn.execute(
             "SELECT MAX(day_high) AS h, MIN(day_low) AS l, MAX(last) AS c "
-            "FROM underlying_snap WHERE symbol=? AND substr(ts,1,10) < ? "
-            "AND ts < ? GROUP BY substr(ts,1,10) ORDER BY substr(ts,1,10) DESC "
-            "LIMIT 1", (symbol, day, ts)).fetchone()
+            "FROM underlying_snap WHERE symbol=? AND substr(event_ts,1,10) < ? "
+            "AND event_ts < ? GROUP BY substr(event_ts,1,10) "
+            "ORDER BY substr(event_ts,1,10) DESC LIMIT 1",
+            (symbol, day, ts)).fetchone()
         if not prior or not (prior["h"] and prior["l"] and prior["c"]) \
                 or prior["h"] <= prior["l"]:
             return False

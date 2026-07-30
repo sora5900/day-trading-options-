@@ -23,7 +23,7 @@ def build_report(conn) -> str:
 
     # data footprint
     days = conn.execute(
-        "SELECT COUNT(DISTINCT substr(ts,1,10)) AS d FROM underlying_snap"
+        "SELECT COUNT(DISTINCT substr(event_ts,1,10)) AS d FROM underlying_snap"
     ).fetchone()["d"]
     n_chain = conn.execute("SELECT COUNT(*) AS n FROM chain_snap").fetchone()["n"]
     lines.append(f"Data: {days} trading days collected, {n_chain:,} chain rows.")

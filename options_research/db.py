@@ -1,35 +1,56 @@
-"""SQLite schema and access helpers.
+"""SQLite schema and the no-look-ahead query layer.
 
-Schema follows OPTIONS_RESEARCH_SPEC.md §3 exactly, plus one table
-(`split_config`) that freezes the train/test split rule so it cannot be
-quietly changed after analysis has begun.
+SCHEMA v2 — platform upgrades #1-#3:
+  * `event_ts` (the EXCHANGE timestamp) is the authoritative event time on all
+    raw tables and is what every downstream read is bounded by.
+  * `fetch_ts`, `source`, and `delay_class` are stored separately and are
+    data-quality metadata only. `fetch_ts` must never be used as an event time
+    — a variable API delay would smear every time-of-day result.
+  * `delay_class` travels all the way through to `paper_trades.data_era`, so
+    the validator can refuse to pool delayed-era and realtime-era rows in one
+    validation sample.
 
-Raw tables (underlying_snap, chain_snap) are never edited and never derived.
-Features are recomputable — safe to drop and rebuild.
+Raw tables are never edited and never derived. Features are recomputable.
 """
 
 import os
 import sqlite3
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 -- ── RAW TRUTH (never edited, never derived) ──────────────────────────────
 CREATE TABLE IF NOT EXISTS underlying_snap (
-  ts TEXT, symbol TEXT,
+  event_ts TEXT NOT NULL,            -- EXCHANGE timestamp: authoritative
+  symbol TEXT NOT NULL,
   last REAL, bid REAL, ask REAL, volume INTEGER,
   vwap REAL, day_open REAL, day_high REAL, day_low REAL, prev_close REAL,
-  PRIMARY KEY (ts, symbol));
+  fetch_ts TEXT NOT NULL,            -- when WE called (metadata only)
+  source TEXT NOT NULL,
+  delay_class TEXT NOT NULL,         -- 'realtime' | 'delayed_15m' | 'unknown'
+  PRIMARY KEY (event_ts, symbol, source));
+CREATE INDEX IF NOT EXISTS idx_under_lookup
+  ON underlying_snap(symbol, event_ts);
 
 CREATE TABLE IF NOT EXISTS chain_snap (
-  ts TEXT, symbol TEXT, expiry TEXT, strike REAL, right TEXT,
+  event_ts TEXT NOT NULL,
+  symbol TEXT NOT NULL, expiry TEXT NOT NULL, strike REAL NOT NULL,
+  right TEXT NOT NULL,
   bid REAL, ask REAL, last REAL, volume INTEGER, open_interest INTEGER,
   iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL,
   underlying REAL,
-  PRIMARY KEY (ts, symbol, expiry, strike, right));
-CREATE INDEX IF NOT EXISTS idx_chain_lookup ON chain_snap(symbol, expiry, ts);
+  fetch_ts TEXT NOT NULL,
+  source TEXT NOT NULL,
+  delay_class TEXT NOT NULL,
+  PRIMARY KEY (event_ts, symbol, expiry, strike, right, source));
+CREATE INDEX IF NOT EXISTS idx_chain_lookup
+  ON chain_snap(symbol, expiry, event_ts);
+CREATE INDEX IF NOT EXISTS idx_chain_leg
+  ON chain_snap(symbol, expiry, strike, right, event_ts);
 
 -- ── DERIVED FEATURES (recomputable; safe to drop and rebuild) ────────────
 CREATE TABLE IF NOT EXISTS features (
-  ts TEXT, symbol TEXT,
+  ts TEXT, symbol TEXT,              -- ts is a decision time on the event clock
   iv30 REAL, iv_rank REAL, iv_percentile REAL,
   realized_vol_5m REAL, realized_vol_30m REAL,
   vrp REAL,
@@ -38,6 +59,7 @@ CREATE TABLE IF NOT EXISTS features (
   skew_25d REAL, term_slope REAL,
   liquidity_score REAL,
   regime TEXT,
+  delay_class TEXT,
   PRIMARY KEY (ts, symbol));
 
 -- ── SETUPS & PAPER TRADES ────────────────────────────────────────────────
@@ -57,7 +79,9 @@ CREATE TABLE IF NOT EXISTS paper_trades (
   pnl_gross REAL, pnl_net REAL, commissions REAL,
   max_adverse REAL, max_favorable REAL,
   outcome TEXT,
-  split TEXT);
+  split TEXT,
+  data_era TEXT,                     -- delay_class at entry; never pool eras
+  fill_scenario TEXT);               -- 'optimistic' | 'base' | 'pessimistic'
 
 CREATE TABLE IF NOT EXISTS strategy_verdicts (
   strategy TEXT, version TEXT, as_of TEXT,
@@ -71,13 +95,21 @@ CREATE TABLE IF NOT EXISTS data_quality (
   stale_secs REAL, missing_contracts INTEGER, wide_spread_frac REAL,
   crossed_book INTEGER, note TEXT);
 
--- ── SPLIT FREEZE (not in spec schema, demanded by spec §3/§7 discipline) ─
--- One row, written once. The train/test cutoff date can never be silently
--- changed: attempting to assign splits with a different cutoff is an error.
+-- ── SPLIT FREEZE ────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS split_config (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   cutoff_date TEXT NOT NULL,
   frozen_at TEXT NOT NULL);
+
+-- ── CAPABILITY PROBE LOG ────────────────────────────────────────────────
+-- Every probe run is retained: an entitlement that changes mid-study is a
+-- data-regime change and must be visible in the record.
+CREATE TABLE IF NOT EXISTS capability_probe (
+  ts TEXT, provider TEXT, requirement_id TEXT, status TEXT,
+  detail TEXT, raw_error TEXT, evidence_json TEXT);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
 """
 
 
@@ -90,51 +122,68 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    conn.execute("INSERT OR IGNORE INTO schema_meta (id, version) VALUES (1, ?)",
+                 (SCHEMA_VERSION,))
+    conn.commit()
     return conn
 
 
 # ── No-look-ahead query layer ────────────────────────────────────────────────
-# Every decision-time read goes through these. A decision at time T may only
-# use data timestamped <= T (spec §5 rule 6). tests/test_no_lookahead.py
-# asserts this behaviour.
+# A decision at time T may only use data with event_ts <= T (spec §5.6).
+# Bounded by the EXCHANGE clock, never the fetch clock.
 
-def chain_at(conn, symbol: str, as_of: str):
+def chain_at(conn, symbol: str, as_of: str, source: str | None = None):
     """Latest chain snapshot at or before `as_of`. Never returns future rows."""
-    row = conn.execute(
-        "SELECT MAX(ts) AS ts FROM chain_snap WHERE symbol=? AND ts<=?",
-        (symbol, as_of)).fetchone()
-    if not row or row["ts"] is None:
+    q = ("SELECT MAX(event_ts) AS t FROM chain_snap "
+         "WHERE symbol=? AND event_ts<=?")
+    args = [symbol, as_of]
+    if source:
+        q += " AND source=?"
+        args.append(source)
+    row = conn.execute(q, args).fetchone()
+    if not row or row["t"] is None:
         return []
-    return conn.execute(
-        "SELECT * FROM chain_snap WHERE symbol=? AND ts=?",
-        (symbol, row["ts"])).fetchall()
+    q2 = "SELECT * FROM chain_snap WHERE symbol=? AND event_ts=?"
+    args2 = [symbol, row["t"]]
+    if source:
+        q2 += " AND source=?"
+        args2.append(source)
+    return conn.execute(q2, args2).fetchall()
 
 
 def underlying_at(conn, symbol: str, as_of: str):
-    """Latest underlying snapshot at or before `as_of`."""
     return conn.execute(
-        "SELECT * FROM underlying_snap WHERE symbol=? AND ts<=? "
-        "ORDER BY ts DESC LIMIT 1", (symbol, as_of)).fetchone()
+        "SELECT * FROM underlying_snap WHERE symbol=? AND event_ts<=? "
+        "ORDER BY event_ts DESC LIMIT 1", (symbol, as_of)).fetchone()
 
 
 def underlying_between(conn, symbol: str, start: str, as_of: str):
-    """Underlying snapshots in [start, as_of], ascending. Bounded above by as_of."""
     return conn.execute(
-        "SELECT * FROM underlying_snap WHERE symbol=? AND ts>=? AND ts<=? "
-        "ORDER BY ts ASC", (symbol, start, as_of)).fetchall()
+        "SELECT * FROM underlying_snap WHERE symbol=? AND event_ts>=? "
+        "AND event_ts<=? ORDER BY event_ts ASC",
+        (symbol, start, as_of)).fetchall()
 
 
 def features_history(conn, symbol: str, as_of: str, limit: int = 5000):
     """Feature rows strictly before `as_of`, newest first."""
     return conn.execute(
-        "SELECT * FROM features WHERE symbol=? AND ts<? ORDER BY ts DESC LIMIT ?",
-        (symbol, as_of, limit)).fetchall()
+        "SELECT * FROM features WHERE symbol=? AND ts<? ORDER BY ts DESC "
+        "LIMIT ?", (symbol, as_of, limit)).fetchall()
 
 
 def quote_for_leg(conn, symbol: str, expiry: str, strike: float, right: str,
                   as_of: str):
-    """Latest quote for one contract at or before `as_of`."""
     return conn.execute(
         "SELECT * FROM chain_snap WHERE symbol=? AND expiry=? AND strike=? "
-        "AND right=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+        "AND right=? AND event_ts<=? ORDER BY event_ts DESC LIMIT 1",
         (symbol, expiry, strike, right, as_of)).fetchone()
+
+
+def record_probe(conn, provider: str, ts: str, results) -> None:
+    import json
+    conn.executemany(
+        "INSERT INTO capability_probe VALUES (?,?,?,?,?,?,?)",
+        [(ts, provider, r.requirement_id, r.status.value, r.detail,
+          r.raw_error, json.dumps(r.evidence, default=str))
+         for r in results])
+    conn.commit()

@@ -6,15 +6,21 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Config:
-    # Universe (spec §4)
+    # Universe. XSP (H1 arm B) is enabled only if the capability probe
+    # confirms both the option chain and the underlying index value — it is
+    # never assumed available.
     symbols: tuple = ("SPY", "QQQ")
+    arm_b_symbol: str = "XSP"
+    arm_b_enabled: bool = False          # set by the probe, never by hand
     strike_band_pct: float = 0.07        # strikes within ±7% of spot
     dte_min: int = 0
     dte_max: int = 7                     # 0-7 DTE: day-trading research
 
-    # Cadence (spec §4) — start at 5-min chain cadence
+    # Cadence: 1-minute chain snapshots (~10.6 GB/yr). Storage is a rounding
+    # error against permanently foreclosing timing questions — you cannot
+    # resample the past.
     underlying_cadence_secs: int = 15
-    chain_cadence_secs: int = 300
+    chain_cadence_secs: int = 60
     wide_snapshot_times_et: tuple = ("09:35", "12:45", "15:55")
 
     # Paper fill engine (spec §5) — non-negotiable realism

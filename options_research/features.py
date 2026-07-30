@@ -19,8 +19,8 @@ ANNUALIZE_MIN = math.sqrt(252 * 390)   # per-minute log-returns → annual vol
 def _realized_vol(rows, window_min: float, as_of: str) -> float | None:
     """Annualized realized vol from underlying `last` over trailing window."""
     cutoff = cal.parse_ts(as_of) - timedelta(minutes=window_min)
-    pts = [(cal.parse_ts(r["ts"]), r["last"]) for r in rows
-           if r["last"] and cal.parse_ts(r["ts"]) >= cutoff]
+    pts = [(cal.parse_ts(r["event_ts"]), r["last"]) for r in rows
+           if r["last"] and cal.parse_ts(r["event_ts"]) >= cutoff]
     if len(pts) < 5:
         return None
     rets, prev_t, prev_p = [], None, None
@@ -86,10 +86,11 @@ def _atr_pct(conn, symbol: str, as_of: str, n_days: int = 14) -> float | None:
     """ATR% from prior days' EOD-ish snapshot rows (true range vs prev close)."""
     day = cal.trading_day_of(as_of)
     rows = conn.execute(
-        "SELECT substr(ts,1,10) AS d, MAX(day_high) AS h, MIN(day_low) AS l, "
-        "MAX(prev_close) AS pc, MAX(last) AS c FROM underlying_snap "
-        "WHERE symbol=? AND ts<? AND substr(ts,1,10) < ? "
-        "GROUP BY substr(ts,1,10) ORDER BY d DESC LIMIT ?",
+        "SELECT substr(event_ts,1,10) AS d, MAX(day_high) AS h, "
+        "MIN(day_low) AS l, MAX(prev_close) AS pc, MAX(last) AS c "
+        "FROM underlying_snap WHERE symbol=? AND event_ts<? "
+        "AND substr(event_ts,1,10) < ? "
+        "GROUP BY substr(event_ts,1,10) ORDER BY d DESC LIMIT ?",
         (symbol, as_of, day, n_days)).fetchall()
     trs = []
     for r in rows:
@@ -149,7 +150,7 @@ def compute_features(conn, symbol: str, ts: str) -> dict | None:
     mins = cal.minutes_since_open(ts)
     if mins is not None and mins >= 0:
         orb_rows = [r for r in day_rows
-                    if (m := cal.minutes_since_open(r["ts"])) is not None
+                    if (m := cal.minutes_since_open(r["event_ts"])) is not None
                     and 0 <= m <= 15 and r["last"]]
         if orb_rows:
             orb_high = max(r["last"] for r in orb_rows)
@@ -173,14 +174,16 @@ def compute_features(conn, symbol: str, ts: str) -> dict | None:
         "term_slope": term_slope,
         "liquidity_score": _liquidity_score(chain, spot),
         "regime": _regime(vwap_dev, rv30, rv_hist),
+        # carried through so the validator can refuse to pool data eras
+        "delay_class": u["delay_class"],
     }
     conn.execute(
         "INSERT OR REPLACE INTO features VALUES "
-        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row["ts"], row["symbol"], row["iv30"], row["iv_rank"],
          row["iv_percentile"], row["realized_vol_5m"], row["realized_vol_30m"],
          row["vrp"], row["orb_high"], row["orb_low"], row["orb_broken"],
          row["vwap_dev"], row["atr_pct"], row["skew_25d"], row["term_slope"],
-         row["liquidity_score"], row["regime"]))
+         row["liquidity_score"], row["regime"], row["delay_class"]))
     conn.commit()
     return row
