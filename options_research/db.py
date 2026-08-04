@@ -48,6 +48,18 @@ CREATE INDEX IF NOT EXISTS idx_chain_lookup
 CREATE INDEX IF NOT EXISTS idx_chain_leg
   ON chain_snap(symbol, expiry, strike, right, event_ts);
 
+-- ── HISTORICAL BARS (backfilled aggregates; the free-tier data source) ───
+-- Separate from underlying_snap: bars are OHLCV aggregates with no bid/ask,
+-- so they can never be mistaken for quotes by the fill engine.
+CREATE TABLE IF NOT EXISTS underlying_bars (
+  event_ts TEXT NOT NULL,            -- bar OPEN time, exchange clock
+  symbol TEXT NOT NULL,
+  open REAL, high REAL, low REAL, close REAL,
+  volume INTEGER, vwap REAL, n_trades INTEGER,
+  fetch_ts TEXT, source TEXT NOT NULL,
+  PRIMARY KEY (event_ts, symbol, source));
+CREATE INDEX IF NOT EXISTS idx_bars_lookup ON underlying_bars(symbol, event_ts);
+
 -- ── DERIVED FEATURES (recomputable; safe to drop and rebuild) ────────────
 CREATE TABLE IF NOT EXISTS features (
   ts TEXT, symbol TEXT,              -- ts is a decision time on the event clock

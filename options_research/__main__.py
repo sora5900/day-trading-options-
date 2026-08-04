@@ -69,6 +69,21 @@ def main():
     sub.add_parser("validate")
     p = sub.add_parser("report")
     p.add_argument("--trades", action="store_true", help="recent trades table")
+    p = sub.add_parser("backfill", help="historical 1-min bars (free tier)")
+    p.add_argument("--symbols", default="SPY,QQQ")
+    p.add_argument("--years", type=float, default=2.0)
+    p.add_argument("--rate", type=int, default=5,
+                   help="requests per minute allowed by the plan")
+    p.add_argument("--discover", action="store_true",
+                   help="probe how far back this plan actually serves")
+
+    p = sub.add_parser("momentum", help="H3-P1 stage 1 (+ stage 2 hurdle)")
+    p.add_argument("--symbol", default="SPY")
+    p.add_argument("--option-friction", type=float, default=None,
+                   help="round-trip option friction as a fraction of premium; "
+                        "omit to use C2's measured value if available")
+    p.add_argument("--leverage", type=float, default=20.0)
+
     sub.add_parser("manifest")
     sub.add_parser("controls")
     p = sub.add_parser("replay")
@@ -144,6 +159,48 @@ def main():
         res = assign_splits(conn, args.cutoff)
         print(f"split frozen at {res['cutoff']}: "
               f"+{res['assigned_train']} train, +{res['assigned_test']} test rows")
+
+    elif args.cmd == "backfill":
+        from datetime import date, timedelta
+        from . import backfill as bf
+        from .sources.polygon import PolygonSource
+        if not cfg.polygon_api_key:
+            sys.exit("POLYGON_API_KEY is not set")
+        src = PolygonSource(cfg.polygon_api_key)
+        src.resolve_base()
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        limiter = bf.RateLimiter(args.rate)
+        if args.discover:
+            for sym in symbols:
+                earliest = bf.discover_lookback(src, sym, limiter)
+                print(f"{sym}: earliest 1-min bars available ~ {earliest}")
+            return
+        end = date.today()
+        start = end - timedelta(days=int(365 * args.years))
+        print(f"backfilling {symbols} {start} .. {end} at {args.rate} req/min "
+              f"(~1 call per month of history)")
+        totals = bf.run(conn, src, symbols, start, end, args.rate)
+        for sym in symbols:
+            print(f"  {sym}: {totals.get(sym, 0):,} bars stored — "
+                  f"{bf.coverage(conn, sym)}")
+
+    elif args.cmd == "momentum":
+        from .analysis import intraday_momentum as im
+        s1 = im.run(conn, args.symbol)
+        friction = args.option_friction
+        if friction is None:
+            from .validator import measured_friction
+            fr = measured_friction(conn)
+            if fr and fr.get("avg_spread_pct"):
+                # round trip: spread paid on entry and again on exit
+                friction = fr["avg_spread_pct"] * 2
+        s2 = (im.stage2_hurdle(s1, friction, args.leverage)
+              if (friction and "error" not in s1) else None)
+        print(im.render(s1, s2))
+        if friction is None and "error" not in s1:
+            print("\n(stage 2 skipped: no measured option friction yet. "
+                  "Re-run with --option-friction 0.15 to test a 15% "
+                  "round-trip assumption, or wait for C2 to measure it.)")
 
     elif args.cmd == "manifest":
         from .reporter import manifest_report
