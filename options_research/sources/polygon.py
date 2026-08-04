@@ -9,6 +9,7 @@ assumption baked into this file. Where the correct request shape is uncertain
 reports which one the API accepted.
 """
 
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -18,7 +19,11 @@ from ..capabilities import CheckResult, Status
 from .base import (QuoteSource, epoch_to_iso, classify_delay,
                    DELAY_UNKNOWN)
 
-BASE = "https://api.polygon.io"
+# Polygon rebranded to Massive. Both hosts are tried unless one is pinned via
+# MASSIVE_API_BASE / POLYGON_API_BASE, and the probe reports which answered.
+CANDIDATE_BASES = ("https://api.polygon.io", "https://api.massive.com")
+BASE = os.environ.get("MASSIVE_API_BASE") or os.environ.get(
+    "POLYGON_API_BASE") or CANDIDATE_BASES[0]
 
 
 class PolygonError(RuntimeError):
@@ -31,12 +36,37 @@ class PolygonError(RuntimeError):
 class PolygonSource(QuoteSource):
     name = "polygon"
 
-    def __init__(self, api_key: str, timeout: float = 20.0):
+    def __init__(self, api_key: str, timeout: float = 20.0,
+                 base: str | None = None):
         if not api_key:
             raise ValueError("POLYGON_API_KEY is not set")
         self.key = api_key
         self.timeout = timeout
+        self.base = base or BASE
         self.session = requests.Session()
+
+    def resolve_base(self) -> str:
+        """Find the host that actually answers this key.
+
+        Polygon rebranded to Massive; depending on account vintage either host
+        may serve, so this is detected rather than assumed. Pin it with
+        MASSIVE_API_BASE to skip the probing.
+        """
+        if os.environ.get("MASSIVE_API_BASE") or os.environ.get(
+                "POLYGON_API_BASE"):
+            return self.base
+        for candidate in CANDIDATE_BASES:
+            try:
+                r = self.session.get(
+                    candidate + "/v3/reference/tickers",
+                    params={"ticker": "SPY", "limit": 1, "apiKey": self.key},
+                    timeout=self.timeout)
+                if r.status_code < 500:
+                    self.base = candidate
+                    return candidate
+            except requests.RequestException:
+                continue
+        return self.base
 
     # ── transport ───────────────────────────────────────────────────────────
 
@@ -45,7 +75,7 @@ class PolygonSource(QuoteSource):
         params = dict(params or {})
         params["apiKey"] = self.key
         url = (path_or_url if path_or_url.startswith("http")
-               else BASE + path_or_url)
+               else self.base + path_or_url)
         last = None
         for attempt in range(retries):
             try:
@@ -163,10 +193,13 @@ class PolygonSource(QuoteSource):
         results: list[CheckResult] = []
         add = results.append
 
-        # 1. auth
+        # 1. auth (also settles which host serves this account)
+        base = self.resolve_base()
         try:
             self._get("/v3/reference/tickers", {"ticker": "SPY", "limit": 1})
-            add(CheckResult("auth", Status.PASS, "key authenticates"))
+            add(CheckResult("auth", Status.PASS,
+                            f"key authenticates against {base}",
+                            evidence={"api_base": base}))
         except PolygonError as e:
             add(CheckResult("auth", Status.FAIL,
                             f"HTTP {e.status_code}", e.body[:300]))
