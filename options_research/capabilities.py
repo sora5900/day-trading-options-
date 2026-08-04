@@ -110,6 +110,12 @@ REQUIREMENTS: tuple[Requirement, ...] = (
         "HIGH VALUE: H3-P1 stage 1 needs only underlying bars, so lookback "
         "here converts a months-long wait into an immediate answer"),
     Requirement(
+        "option_aggs_historical",
+        "Historical aggregates for individual OPTION contracts", frozenset(),
+        "HIGH VALUE without quotes: close prices cannot model fills, but they "
+        "CAN measure how rich implied vol actually is. That is the pivotal "
+        "VRP question, answerable on cheap data before buying quote data"),
+    Requirement(
         "rate_limit",
         "Sustained request rate sufficient for the collection cadence",
         frozenset(),

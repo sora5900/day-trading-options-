@@ -359,10 +359,59 @@ class PolygonSource(QuoteSource):
         # 13. historical 1-minute aggregates
         results.append(self._historical_aggs_check())
 
-        # 14. measured rate limit — decides whether 1-min collection is possible
+        # 14. historical aggregates for an individual option contract
+        results.append(self._option_aggs_check(chain))
+
+        # 15. measured rate limit — decides whether 1-min collection is possible
         results.append(self._rate_limit_check())
 
         return results
+
+    def _option_aggs_check(self, chain: list) -> CheckResult:
+        """Can we get a price HISTORY for a single option contract?
+
+        Close prices cannot model fills, but they can measure how rich implied
+        vol has actually been — the question that decides whether VRP is worth
+        pursuing at all.
+        """
+        if not chain:
+            return CheckResult("option_aggs_historical", Status.SKIP,
+                               "no chain available to pick a contract from")
+        # prefer a liquid near-ATM contract with real open interest
+        cands = [c for c in chain
+                 if c.get("open_interest") and c["open_interest"] > 100
+                 and c.get("expiry") and c.get("strike")]
+        if not cands:
+            cands = [c for c in chain if c.get("expiry") and c.get("strike")]
+        c = cands[len(cands) // 2]
+        try:
+            occ = self._occ_ticker("SPY", c["expiry"], c["strike"], c["right"])
+        except Exception:                                # noqa: BLE001
+            return CheckResult("option_aggs_historical", Status.SKIP,
+                               "could not build an OCC ticker")
+        end = date.today()
+        start = end - timedelta(days=30)
+        for span, unit in (("1", "day"), ("1", "minute")):
+            try:
+                j = self._get(
+                    f"/v2/aggs/ticker/{occ}/range/{span}/{unit}/"
+                    f"{start.isoformat()}/{end.isoformat()}",
+                    {"adjusted": "true", "sort": "asc", "limit": 5000})
+                n = len(j.get("results") or [])
+                if n:
+                    return CheckResult(
+                        "option_aggs_historical", Status.PASS,
+                        f"{n} {unit} bars for {occ} over 30d — implied-vol "
+                        f"richness is measurable without quote data",
+                        evidence={"ticker": occ, "granularity": unit,
+                                  "n_bars": n})
+            except PolygonError as e:
+                return CheckResult(
+                    "option_aggs_historical", Status.FAIL,
+                    f"HTTP {e.status_code} for {occ}", e.body[:300])
+        return CheckResult("option_aggs_historical", Status.WARN,
+                           f"endpoint reachable but no bars for {occ} "
+                           f"(contract may be too new or illiquid)")
 
     def _rate_limit_check(self, burst: int = 8) -> CheckResult:
         """Measure the sustainable request rate by bursting until throttled.
