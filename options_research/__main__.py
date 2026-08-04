@@ -57,6 +57,9 @@ def main():
     p = sub.add_parser("probe")
     p.add_argument("--source", choices=("polygon", "tradier"),
                    default="polygon")
+    p.add_argument("--sample", action="store_true",
+                   help="dump one RAW contract from the chain snapshot, to "
+                        "see exactly which fields the plan returns")
     p = sub.add_parser("collect")
     p.add_argument("--once", action="store_true")
     sub.add_parser("run")
@@ -110,6 +113,37 @@ def main():
             if not cfg.tradier_token:
                 sys.exit("TRADIER_TOKEN is not set")
             src = TradierSource(cfg.tradier_token, cfg.tradier_base)
+        if args.sample:
+            import json as _json
+            from .sources.polygon import PolygonError
+            print("RAW chain-snapshot contract, exactly as the API returned "
+                  "it.\nUse this to see which blocks the plan populates "
+                  "(last_quote, greeks, day, ...).\n" + "=" * 74)
+            try:
+                j = src._get("/v3/snapshot/options/SPY", {"limit": 3})
+                results = j.get("results") or []
+                if not results:
+                    print("no results returned")
+                for c in results[:2]:
+                    print(_json.dumps(c, indent=2)[:2500])
+                    print("-" * 74)
+                print("top-level keys present on contract 1:",
+                      sorted(results[0].keys()) if results else [])
+            except PolygonError as e:
+                print(f"HTTP {e.status_code}: {e.body[:400]}")
+            print("=" * 74)
+            print("\nAlso testing the standalone options quote endpoints:")
+            for path, label in (
+                    ("/v3/quotes/O:SPY260807C00760000", "historical NBBO"),
+                    ("/v2/last/nbbo/O:SPY260807C00760000", "last NBBO")):
+                try:
+                    r = src._get(path, {"limit": 1})
+                    print(f"  {label:18s} OK  keys={sorted(r.keys())}")
+                except PolygonError as e:
+                    print(f"  {label:18s} HTTP {e.status_code} "
+                          f"{e.body[:160]}")
+            return
+
         report = Collector(conn, src, cfg).probe()
         print(report.render())
         xsp_chain = report.by_id("xsp_options")
