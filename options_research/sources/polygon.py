@@ -273,7 +273,55 @@ class PolygonSource(QuoteSource):
         # 13. historical 1-minute aggregates
         results.append(self._historical_aggs_check())
 
+        # 14. measured rate limit — decides whether 1-min collection is possible
+        results.append(self._rate_limit_check())
+
         return results
+
+    def _rate_limit_check(self, burst: int = 8) -> CheckResult:
+        """Measure the sustainable request rate by bursting until throttled.
+
+        Free tiers commonly cap at ~5 requests/minute, which would make the
+        planned 1-minute chain cadence impossible. Measured, never assumed.
+        """
+        ok = 0
+        throttled_at = None
+        start = time.monotonic()
+        for i in range(burst):
+            try:
+                self._get("/v3/reference/tickers",
+                          {"ticker": "SPY", "limit": 1}, retries=1)
+                ok += 1
+            except PolygonError as e:
+                if e.status_code == 429:
+                    throttled_at = i + 1
+                    break
+                return CheckResult("rate_limit", Status.WARN,
+                                   f"probe inconclusive: HTTP {e.status_code}",
+                                   e.body[:200])
+            except Exception as e:                       # noqa: BLE001
+                return CheckResult("rate_limit", Status.WARN,
+                                   "probe inconclusive", str(e)[:200])
+        elapsed = max(time.monotonic() - start, 0.001)
+        rate = ok / elapsed * 60.0
+
+        # a filtered chain snapshot costs roughly 2-4 paginated calls/symbol
+        calls_per_snapshot, symbols = 3, 2
+        per_cycle = calls_per_snapshot * symbols
+        if throttled_at:
+            return CheckResult(
+                "rate_limit", Status.FAIL,
+                f"throttled after {throttled_at} rapid requests "
+                f"(~{ok} in {elapsed:.1f}s). A chain cycle costs ~{per_cycle} "
+                f"calls, so 1-minute cadence is NOT possible on this plan",
+                evidence={"throttled_after": throttled_at,
+                          "observed_rate_per_min": round(rate, 1)})
+        return CheckResult(
+            "rate_limit", Status.PASS,
+            f"{ok} rapid requests with no throttling "
+            f"(>= {rate:.0f}/min observed); ~{per_cycle} calls per chain "
+            f"cycle, so 1-minute cadence is feasible",
+            evidence={"observed_rate_per_min": round(rate, 1)})
 
     def _field_population_checks(self, chain: list) -> list:
         """A field that exists but is NULL on most contracts is not usable.

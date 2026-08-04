@@ -109,6 +109,12 @@ REQUIREMENTS: tuple[Requirement, ...] = (
         "Historical 1-minute underlying aggregates", frozenset(),
         "HIGH VALUE: H3-P1 stage 1 needs only underlying bars, so lookback "
         "here converts a months-long wait into an immediate answer"),
+    Requirement(
+        "rate_limit",
+        "Sustained request rate sufficient for the collection cadence",
+        frozenset(),
+        "a 5-req/min free-tier cap makes 1-minute chain snapshots impossible; "
+        "the cadence must be derived from the MEASURED limit, not assumed"),
 )
 
 BY_ID = {r.id: r for r in REQUIREMENTS}
