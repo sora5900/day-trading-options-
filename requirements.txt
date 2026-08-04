@@ -1,2 +1,5 @@
 requests>=2.31
 pandas_market_calendars>=4.3
+
+# optional: free fallback source, probe before trusting
+yfinance>=0.2.40

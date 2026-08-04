@@ -55,7 +55,7 @@ def main():
 
     sub.add_parser("init")
     p = sub.add_parser("probe")
-    p.add_argument("--source", choices=("polygon", "tradier"),
+    p.add_argument("--source", choices=("polygon", "tradier", "yahoo"),
                    default="polygon")
     p.add_argument("--sample", action="store_true",
                    help="dump one RAW contract from the chain snapshot, to "
@@ -105,7 +105,13 @@ def main():
         from .collector import Collector
         from .sources.polygon import PolygonSource
         from .sources.tradier import TradierSource
-        if args.source == "polygon":
+        if args.source == "yahoo":
+            from .sources.yahoo import YahooSource, YahooError
+            try:
+                src = YahooSource()
+            except YahooError as e:
+                sys.exit(str(e))
+        elif args.source == "polygon":
             if not cfg.polygon_api_key:
                 sys.exit("POLYGON_API_KEY is not set")
             src = PolygonSource(cfg.polygon_api_key)
