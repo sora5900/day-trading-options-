@@ -60,6 +60,19 @@ CREATE TABLE IF NOT EXISTS underlying_bars (
   PRIMARY KEY (event_ts, symbol, source));
 CREATE INDEX IF NOT EXISTS idx_bars_lookup ON underlying_bars(symbol, event_ts);
 
+-- ── OPTION CONTRACT BARS (aggregates; CLOSE prices, never quotes) ────────
+-- Deliberately separate from chain_snap. These are trade-derived OHLC bars
+-- with no bid/ask, so they can NEVER reach the fill engine. They exist to
+-- measure market-wide implied-vol richness, not to simulate trades.
+CREATE TABLE IF NOT EXISTS option_bars (
+  event_ts TEXT NOT NULL, symbol TEXT NOT NULL, expiry TEXT NOT NULL,
+  strike REAL NOT NULL, right TEXT NOT NULL,
+  open REAL, high REAL, low REAL, close REAL,
+  volume INTEGER, vwap REAL, n_trades INTEGER,
+  fetch_ts TEXT, source TEXT NOT NULL,
+  PRIMARY KEY (event_ts, symbol, expiry, strike, right, source));
+CREATE INDEX IF NOT EXISTS idx_optbars ON option_bars(symbol, expiry, event_ts);
+
 -- ── DERIVED FEATURES (recomputable; safe to drop and rebuild) ────────────
 CREATE TABLE IF NOT EXISTS features (
   ts TEXT, symbol TEXT,              -- ts is a decision time on the event clock

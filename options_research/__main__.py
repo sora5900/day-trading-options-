@@ -87,6 +87,13 @@ def main():
                         "omit to use C2's measured value if available")
     p.add_argument("--leverage", type=float, default=20.0)
 
+    p = sub.add_parser("vrp-backfill",
+                       help="fetch historical ATM straddle closes (Starter)")
+    p.add_argument("--symbols", default="SPY,QQQ")
+    p = sub.add_parser("vrp",
+                       help="measure implied-vol richness from close prices")
+    p.add_argument("--symbol", default="SPY")
+
     p = sub.add_parser("freshness",
                        help="measure whether a source's quotes are live and "
                             "how far behind they are")
@@ -249,6 +256,20 @@ def main():
             print("\n(stage 2 skipped: no measured option friction yet. "
                   "Re-run with --option-friction 0.15 to test a 15% "
                   "round-trip assumption, or wait for C2 to measure it.)")
+
+    elif args.cmd == "vrp-backfill":
+        from . import vrp_backfill
+        from .sources.polygon import PolygonSource
+        if not cfg.polygon_api_key:
+            sys.exit("POLYGON_API_KEY is not set")
+        src = PolygonSource(cfg.polygon_api_key)
+        src.resolve_base()
+        for sym in [s.strip().upper() for s in args.symbols.split(",")]:
+            print(f"{sym}: {vrp_backfill.run(conn, src, sym)}")
+
+    elif args.cmd == "vrp":
+        from .analysis import vrp_magnitude as vm
+        print(vm.render(vm.run(conn, args.symbol)))
 
     elif args.cmd == "freshness":
         from . import freshness as fr
