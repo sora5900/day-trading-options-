@@ -105,6 +105,23 @@ class PolygonSource(QuoteSource):
     # ── normalized reads ────────────────────────────────────────────────────
 
     def get_underlying(self, symbol: str) -> dict | None:
+        """Underlying context, from whichever endpoint the plan entitles.
+
+        The stocks SNAPSHOT endpoint belongs to the Stocks product, which an
+        Options-only subscription does not include. Aggregates are entitled far
+        more widely, and carry everything the features need (last, day OHLC,
+        volume, VWAP), so they are the fallback rather than an error.
+        """
+        try:
+            snap = self._underlying_from_snapshot(symbol)
+            if snap:
+                return snap
+        except PolygonError as e:
+            if e.status_code not in (401, 403):
+                raise
+        return self._underlying_from_aggs(symbol)
+
+    def _underlying_from_snapshot(self, symbol: str) -> dict | None:
         fetch_ts = self._now_iso()
         j = self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}")
         t = j.get("ticker")
@@ -131,6 +148,73 @@ class PolygonSource(QuoteSource):
             "event_ts": event_ts,
             "fetch_ts": fetch_ts,
             "delay_class": classify_delay(event_ts, fetch_ts),
+        }
+
+    def _underlying_from_aggs(self, symbol: str, lookback_days: int = 7
+                              ) -> dict | None:
+        """Build the same shape from 1-minute aggregates.
+
+        Session OHLCV is computed from regular-session bars only — vendors
+        return 04:00-20:00 ET, and letting extended hours into day_high/low or
+        VWAP would quietly corrupt the gap and VWAP features.
+        """
+        fetch_ts = self._now_iso()
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        j = self._get(
+            f"/v2/aggs/ticker/{symbol}/range/1/minute/"
+            f"{start.isoformat()}/{end.isoformat()}",
+            {"adjusted": "true", "sort": "asc", "limit": 50000})
+        results = j.get("results") or []
+        if not results:
+            return None
+
+        bars = []
+        for r in results:
+            iso = epoch_to_iso(r.get("t"))
+            if not iso:
+                continue
+            bars.append((iso, r))
+        if not bars:
+            return None
+
+        # group by the ET trading day the bar belongs to
+        from .. import market_calendar as mcal
+        by_day: dict = {}
+        for iso, r in bars:
+            mins = mcal.minutes_since_open(iso)
+            if mins is None or not (0 <= mins < 390):
+                continue                       # skip extended hours entirely
+            by_day.setdefault(mcal.trading_day_of(iso), []).append((iso, r))
+        if not by_day:
+            return None
+
+        days = sorted(by_day)
+        today_bars = by_day[days[-1]]
+        prev_close = None
+        if len(days) > 1:
+            prev_close = by_day[days[-2]][-1][1].get("c")
+
+        last_iso, last_bar = today_bars[-1]
+        highs = [b[1].get("h") for b in today_bars if b[1].get("h") is not None]
+        lows = [b[1].get("l") for b in today_bars if b[1].get("l") is not None]
+        vol = sum(b[1].get("v") or 0 for b in today_bars)
+        # session VWAP, volume-weighted across the bars' own vwaps
+        num = sum((b[1].get("vw") or 0) * (b[1].get("v") or 0)
+                  for b in today_bars)
+        vwap = (num / vol) if vol else None
+
+        return {
+            "last": last_bar.get("c"),
+            "bid": None, "ask": None,          # aggregates carry no quotes
+            "volume": vol, "vwap": vwap,
+            "day_open": today_bars[0][1].get("o"),
+            "day_high": max(highs) if highs else None,
+            "day_low": min(lows) if lows else None,
+            "prev_close": prev_close,
+            "event_ts": last_iso,
+            "fetch_ts": fetch_ts,
+            "delay_class": classify_delay(last_iso, fetch_ts),
         }
 
     def get_chain(self, symbol, spot, strike_band_pct, dte_min, dte_max):
@@ -227,10 +311,12 @@ class PolygonSource(QuoteSource):
                                        "day_high", "day_low", "prev_close")
                            if u.get(k) is None]
                 vwap_note = "" if u.get("vwap") is not None else " (vwap NULL)"
+                path = ("stocks snapshot" if u.get("bid") is not None
+                        else "1-min aggregates (Options-only plan)")
                 add(CheckResult(
                     "underlying_snapshot",
                     Status.PASS if not missing else Status.WARN,
-                    f"SPY last={spot}{vwap_note}"
+                    f"SPY last={spot} via {path}{vwap_note}"
                     + (f" missing={missing}" if missing else ""),
                     evidence={k: u.get(k) for k in
                               ("last", "bid", "ask", "vwap", "day_open",
@@ -438,6 +524,24 @@ class PolygonSource(QuoteSource):
                       "call_strike": legs["C"]["strike"],
                       "put_strike": legs["P"]["strike"]})
 
+    def underlying_price_from_chain(self, ticker: str) -> float | None:
+        """Underlying level as reported inside the OPTION chain snapshot.
+
+        This is served by the Options product, so it needs no Stocks or
+        Indices subscription — and it is the same instant as the chain, which
+        is what the fill engine and moneyness calculations actually want.
+        """
+        try:
+            j = self._get(f"/v3/snapshot/options/{ticker}", {"limit": 1})
+        except PolygonError:
+            return None
+        for c in (j.get("results") or []):
+            ua = c.get("underlying_asset") or {}
+            price = ua.get("price") or ua.get("value")
+            if price:
+                return price
+        return None
+
     def _xsp_checks(self) -> list:
         """XSP ticker conventions differ for index options; try candidates."""
         out = []
@@ -459,6 +563,7 @@ class PolygonSource(QuoteSource):
             else "no XSP option chain returned",
             "" if chain_ok else chain_err))
 
+        # 1. the Indices product, if subscribed
         idx_ok, idx_form, idx_err = None, None, ""
         for form in ("I:XSP", "I:SPX"):
             try:
@@ -470,13 +575,27 @@ class PolygonSource(QuoteSource):
             except PolygonError as e:
                 idx_ok = False
                 idx_err = (f"{form}: HTTP {e.status_code} {e.body[:160]}")
+        if idx_ok:
+            out.append(CheckResult(
+                "xsp_underlying", Status.PASS,
+                f"index value available via '{idx_form}' (Indices product)"))
+            return out
+
+        # 2. fall back to the level carried inside the XSP option chain
+        if chain_ok:
+            price = self.underlying_price_from_chain(chain_form)
+            if price:
+                out.append(CheckResult(
+                    "xsp_underlying", Status.PASS,
+                    f"index level {price} taken from the XSP option chain "
+                    f"(no Indices subscription needed)",
+                    evidence={"source": "option_chain_underlying_asset",
+                              "price": price}))
+                return out
         out.append(CheckResult(
-            "xsp_underlying",
-            Status.PASS if idx_ok else Status.FAIL,
-            f"index value available via '{idx_form}'" if idx_ok
-            else "index value NOT available — likely requires a separate "
-                 "Indices subscription",
-            "" if idx_ok else idx_err))
+            "xsp_underlying", Status.FAIL,
+            "index level unavailable from the Indices product or the option "
+            "chain", idx_err))
         return out
 
     def _historical_quotes_check(self, chain: list) -> CheckResult:
