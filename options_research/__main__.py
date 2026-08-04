@@ -87,6 +87,14 @@ def main():
                         "omit to use C2's measured value if available")
     p.add_argument("--leverage", type=float, default=20.0)
 
+    p = sub.add_parser("freshness",
+                       help="measure whether a source's quotes are live and "
+                            "how far behind they are")
+    p.add_argument("--source", choices=("yahoo", "tradier", "polygon"),
+                   default="yahoo")
+    p.add_argument("--seconds", type=int, default=120)
+    p.add_argument("--symbol", default="SPY")
+
     sub.add_parser("manifest")
     sub.add_parser("controls")
     p = sub.add_parser("replay")
@@ -241,6 +249,26 @@ def main():
             print("\n(stage 2 skipped: no measured option friction yet. "
                   "Re-run with --option-friction 0.15 to test a 15% "
                   "round-trip assumption, or wait for C2 to measure it.)")
+
+    elif args.cmd == "freshness":
+        from . import freshness as fr
+        if args.source == "yahoo":
+            from .sources.yahoo import YahooSource
+            src = YahooSource()
+        elif args.source == "tradier":
+            from .sources.tradier import TradierSource
+            src = TradierSource(cfg.tradier_token, cfg.tradier_base)
+        else:
+            from .sources.polygon import PolygonSource
+            src = PolygonSource(cfg.polygon_api_key)
+        u = src.get_underlying(args.symbol)
+        if not u or not u.get("last"):
+            sys.exit("source returned no underlying price")
+        print(f"sampling {args.symbol} twice, {args.seconds}s apart "
+              f"(this will pause)...")
+        mv = fr.quote_movement(src, args.symbol, u["last"], args.seconds)
+        dl = fr.estimate_delay_vs_reference(conn, src, args.symbol)
+        print(fr.render(mv, dl))
 
     elif args.cmd == "manifest":
         from .reporter import manifest_report
