@@ -43,26 +43,39 @@ def _sessions(conn, symbol: str) -> dict:
     return by_day
 
 
+def session_length_minutes(day: str) -> float | None:
+    """Regular-session length for `day`, from the exchange calendar."""
+    bounds = cal.session_bounds(day)
+    if bounds is None:
+        return None
+    return (bounds[1] - bounds[0]).total_seconds() / 60.0
+
+
 def daily_observations(conn, symbol: str, first_window: int = 30,
                        last_window: int = 30,
-                       session_minutes: int = 390) -> list:
-    """One (day, r1, r_last) per trading day.
+                       full_session_minutes: int = 390) -> list:
+    """One (day, r1, r_last) per FULL trading day.
 
     r1     = first `first_window` minutes, open-to-close
     r_last = final `last_window` minutes, open-to-close
 
-    Half days are excluded: their session length differs, so 'the last 30
-    minutes' is a different object and pooling them would blur the effect.
+    Two things this must get right, both learned from real data:
+
+    1. Vendors include EXTENDED HOURS (04:00-20:00 ET). Session length is
+       therefore taken from the exchange calendar, never inferred from the
+       span of available bars — otherwise a half day looks full and its
+       "last 30 minutes" gets read out of after-hours trading.
+    2. Only regular-session minutes are used. Bars outside [0, session) have
+       negative or overshooting offsets and are excluded by construction.
     """
     out = []
     for day, bars in sorted(_sessions(conn, symbol).items()):
+        length = session_length_minutes(day)
+        if length is None or length < full_session_minutes - 5:
+            continue                      # half day / early close — different object
         bars.sort(key=lambda b: b[0])
-        span = max(b[0] for b in bars)
-        if span < session_minutes - 15:
-            continue                      # half day or badly gapped session
         first = [b for b in bars if 0 <= b[0] < first_window]
-        last = [b for b in bars if session_minutes - last_window <= b[0]
-                <= session_minutes]
+        last = [b for b in bars if length - last_window <= b[0] < length]
         if len(first) < first_window // 2 or len(last) < last_window // 2:
             continue                      # too gappy to trust
         r1 = (first[-1][2] - first[0][1]) / first[0][1]

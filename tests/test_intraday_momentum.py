@@ -97,13 +97,35 @@ def test_refuses_to_report_on_too_few_sessions(conn):
     assert "error" in res and ">= 30" in res["error"]
 
 
-def test_half_days_are_excluded(conn):
-    """A short session's 'last 30 minutes' is a different object."""
+def test_real_half_day_is_excluded(conn):
+    """2025-11-28 is the day after Thanksgiving: a real 13:00 ET early close.
+    Its final 30 minutes are a different object and must not be pooled."""
+    assert im.session_length_minutes("2025-11-28") < 390
     _session(conn, DAYS[0], r1=0.004, r_last=0.002)
-    for m in range(180):                     # 3-hour half day
-        _bar(conn, "SPY", _ts_for(DAYS[1], m), 630.0, 630.5)
+    _session(conn, "2025-11-28", r1=0.004, r_last=0.002)
+    days = {o["day"] for o in im.daily_observations(conn, "SPY")}
+    assert days == {DAYS[0]}
+
+
+def test_extended_hours_bars_do_not_leak_into_windows(conn):
+    """Vendors return 04:00-20:00 ET. Pre-market must not become 'the first
+    30 minutes', and after-hours must not become 'the last 30 minutes' —
+    which is exactly what inferring session length from bar span would do."""
+    from datetime import timedelta
+    day = DAYS[0]
+    _session(conn, day, r1=0.0040, r_last=0.0020)
+    open_utc, close_utc = cal.session_bounds(day)
+    for k in range(1, 121):                  # pre-market, wild prices
+        _bar(conn, "SPY", (open_utc - timedelta(minutes=k)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"), 500.0, 500.0)
+    for k in range(0, 120):                  # after-hours, wild prices
+        _bar(conn, "SPY", (close_utc + timedelta(minutes=k)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"), 900.0, 900.0)
     conn.commit()
-    assert len(im.daily_observations(conn, "SPY")) == 1
+    obs = im.daily_observations(conn, "SPY")
+    assert len(obs) == 1
+    assert obs[0]["r1"] == pytest.approx(0.0040, rel=0.05)
+    assert obs[0]["r_last"] == pytest.approx(0.0020, rel=0.05)
 
 
 # ── stage 2: the gate that keeps the options test set closed ────────────────
