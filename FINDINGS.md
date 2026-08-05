@@ -131,14 +131,68 @@ of the relationship is not stable enough to act on.
 
 ---
 
+## F-003 — The variance risk premium is too thin to trade at retail friction
+
+**Date:** 2026-08-04 · **Data:** 499 days of ATM next-day straddle closes,
+SPY, 2024-08-05 → 2026-07-31 (Massive Options Starter aggregates) ·
+**Cost:** $29 (the Starter month), ~2 minutes of fetching
+
+The question that H1-P1 and H2-P1 both turn on: is index implied volatility
+rich enough to clear retail friction? The PHASE1.md arithmetic requires
+roughly **20% richness** for a $2-wide 0DTE credit spread to survive costs.
+
+### Measurement (model-free, daily closes)
+
+| Measure | Value |
+|---|---|
+| Market charged (mean 1-day priced move) | 0.729% |
+| Market realized (mean next-day move) | 0.686% |
+| Premium | **+4.31 bps/day**, 95% CI **[−1.55, +10.04]** |
+| **Richness** | **5.9%**, CI ≈ **[−2.1%, +13.8%]** |
+| Days premium positive | 60.3% |
+| Minimum detectable at n=499 | 8.31 bps |
+
+The premium is not statistically distinguishable from zero at two years of
+data — and, decisively, **even the upper bound of the interval fails the
+viability threshold**:
+
+| Reading | Richness | Gross on $40 credit | vs round trip $10.60 | vs free expiry $5.30 |
+|---|---|---|---|---|
+| Point estimate | 5.9% | $2.36 | **−$8.24** | **−$2.94** |
+| CI upper bound | 13.8% | $5.51 | **−$5.09** | **+$0.21** |
+
+The single non-negative cell requires simultaneously: the most optimistic
+richness the data allows, a guaranteed free expiry (which the §1 settlement
+model shows SPY does not reliably grant — forced close, assignment, pin
+risk), and no tail events. That is not an edge; that is zero, dressed up.
+
+### Verdict: **H1-P1 and H2-P1 DISCARDED on arithmetic**
+
+Same logic that closed H3-P1: the optimistic bound of the measured effect
+cannot clear measured/modelled costs, so the options test set never opens.
+H2-P1 dies with H1-P1 — it is the same premium with a different trigger, and
+a conditioning cannot rescue a premium that is not there.
+
+### Caveats recorded honestly
+
+- **Close-to-close, not intraday.** This measures the overnight+day straddle
+  premium; H1-P1 as registered trades intraday 0DTE from noon. The intraday
+  premium could differ. But it would need to be ~3× the measured all-day
+  richness to reach viability, with no mechanism suggesting that.
+- One regime (2024–2026, mostly low-vol grind with episodic spikes).
+- The 60.3% positive-day rate shows the classic VRP shape — small steady
+  premium, occasionally devoured by large moves. The shape is real; the size
+  is not tradeable at retail costs.
+- Richness of the ATM straddle is a proxy for richness of a 15Δ spread; skew
+  could make wings relatively richer. Measuring that needs quote data, and
+  nothing in this result justifies buying it.
+
 ## Open questions
 
 | Question | Status | Blocked by |
 |---|---|---|
-| H1-P1 price-space VRP | Not started | Options entitlement (~$29/mo) |
-| H2-P1 conditional VRP | Not started | Options entitlement |
-| C2 measured friction | Not started | Options entitlement |
-| H3-P1 QQQ cross-check | **Done — consistent null** | — |
+| F-003 QQQ cross-check | Pending | Nothing — runnable now |
+| C2 measured friction | Moot unless a new hypothesis needs it | — |
 
 ## Closed
 
@@ -146,3 +200,9 @@ of the relationship is not stable enough to act on.
 |---|---|---|---|
 | H3-P1 (options branch) | **DISCARD — permanently closed** | 2026-08-04 | Fails stage-2 friction hurdle by 26-68× even at the optimistic bound |
 | H3-P1 (shares branch) | **DISCARD — no evidence** | 2026-08-04 | Negative point estimate on both SPY and QQQ |
+| **H1-P1 (price-space VRP)** | **DISCARD — on arithmetic** | 2026-08-04 | Measured richness 5.9% [−2.1%, +13.8%] vs ~20% required; even the optimistic bound nets ≈$0 in the best-case scenario |
+| **H2-P1 (conditional VRP)** | **DISCARD — with H1-P1** | 2026-08-04 | Same premium, different trigger; conditioning cannot rescue a premium that is not there |
+
+**All three registered hypothesis families are now closed.** Total research
+spend: $29 and one evening. The system did what it was built to do: produce
+well-supported "no"s before any capital was risked.
